@@ -1,0 +1,23 @@
+[package]
+name = "vpn-ns-picker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sirdree/mullvad-per-app-vpn"
+description = "Server picker for the vpn-ns Mullvad namespace: countries > cities > servers, search, one click to switch"
+
+[[bin]]
+name = "vpn-ns-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "persistence"] }
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

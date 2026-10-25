@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# vpn-ns: run chosen apps through Mullvad (WireGuard) inside the network namespace "vpn".
+# Everything else on the computer keeps the normal connection; other interfaces and tunnels are never touched.
+# Project: https://github.com/sirdree/mullvad-per-app-vpn  (MIT, unofficial, not affiliated with Mullvad)
+set -euo pipefail
+
+NS=vpn
+IF=wgvpn
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONF_DIR="${VPN_NS_CONF_DIR:-$HOME/.config/vpn-ns}"
+DEFAULT_KEY="$CONF_DIR/mullvad.conf"    # the stored key (private key + tunnel address), chmod 600
+POINTER="$CONF_DIR/key-path"            # only present when the key is stored somewhere else: holds that path
+RELAYS="$CONF_DIR/servers.json"         # public Mullvad server list (cache, no secrets)
+LAST="$CONF_DIR/last"                   # last selected target (country / city / hostname)
+APPS="$CONF_DIR/apps.conf"              # the apps that use the VPN: name|Menu title|command|icon (managed in the apps, or by hand)
+SEED_APPS="$HERE/apps.conf"             # example list copied to $APPS the first time
+DESKTOP_DIR="${VPN_NS_DESKTOP_DIR:-$HOME/.local/share/applications}"
+PORT="${VPN_NS_PORT:-51820}"
+DEFAULT_TARGET="${VPN_NS_DEFAULT:-de}"
+
+die() { echo "vpn-ns: $*" >&2; exit 1; }
+ns_exists() { [ -e "/run/netns/$NS" ]; }
+in_ns() { sudo ip netns exec "$NS" "$@"; }
+
+usage() {
+  cat <<EOF
+Usage: vpn-ns <command>
+  key status              is a valid key stored? prints ok|<path>|<tunnel address>, missing|<path>| or invalid|<path>|<why>
+  key import <file.conf> [--to PATH]    store the key + address of a Mullvad WireGuard .conf (default path: ~/.config/vpn-ns/mullvad.conf)
+  key set --address A [--dns D] [--to PATH]   store a key typed by hand (the private key is read from stdin, never from arguments)
+  key where | key remove  show / delete the stored key
+  browse [file|save|dir] [start]   native file chooser (kdialog or zenity); prints the chosen path
+  up [target]             create the namespace and connect (target: de | fr-par | fr-par-wg-001)
+  switch <target>         change server/country on the fly (apps keep running)
+  down [force]            remove the namespace and tunnel (refuses while apps still run inside, unless 'force')
+  status                  tunnel state and the exit IP seen from inside
+  list [cc | cc-city]     countries; cities of a country; servers of a city (owned/rented, Gbps)
+  pick                    clickable country > city > server list (switches on the fly)
+  current                 hostname of the connected server (empty if down)
+  refresh [force]         update the cached Mullvad server list (only if older than a day, unless 'force')
+  run <cmd...>            run any command inside the VPN namespace
+  app <name>              run an app defined in apps.conf
+  apps list|scan|status   VPN apps (name|title|command|icon); installed apps; which VPN apps run inside the VPN right now
+  apps add <name> <title> <command> [icon]   add an app (browsers get their own profile automatically); apps remove <name>
+  launchers               (re)create the menu entries of the VPN apps and the Desktop icons of the pickers
+EOF
+}
+
+relays_refresh() {   # Mullvad's public list incl. city names, owned/rented, provider, port speed (Gbps); "force" = always download
+  if [ "${1:-}" = force ] || [ ! -s "$RELAYS" ] || [ -n "$(find "$RELAYS" -mtime +1 2>/dev/null)" ]; then
+    curl -fsS --max-time 20 https://api.mullvad.net/www/relays/wireguard/ -o "$RELAYS.tmp" || die "cannot fetch the Mullvad server list"
+    mv "$RELAYS.tmp" "$RELAYS"
+  fi
+}
+
+# rq <mode> [args]: queries the server list, one pipe-separated line per result
+#   countries              cc|Country|cities|servers
+#   cities <cc>            citycode|City|servers|owned|max Gbps
+#   servers <cc[-city]>    hostname|City|Mullvad-owned or rented (provider)|Gbps
+#   pick <target>          hostname ip public_key (random active server; target = cc | cc-city | hostname)
+#   byip <ip>              hostname that has this entry IP
+#   describe <hostname>    City, Country · owned/rented · Gbps
+rq() {
+  relays_refresh
+  python3 -I - "$RELAYS" "$@" <<'PY'
+import json, random, sys, collections
+d = json.load(open(sys.argv[1])); mode = sys.argv[2]; a = sys.argv[3:]
+rel = sorted((r for r in d if r.get('active') and r.get('type', 'wireguard') == 'wireguard'),
+             key=lambda r: (r['country_name'], r['city_name'], r['hostname']))
+own = lambda r: "Mullvad-owned" if r['owned'] else "rented (%s)" % r['provider']
+loc = lambda r: r['country_code'] + '-' + r['city_code']
+if mode == 'countries':
+    c = collections.OrderedDict()
+    for r in rel:
+        e = c.setdefault(r['country_code'], [r['country_name'], set(), 0]); e[1].add(r['city_code']); e[2] += 1
+    for cc, (n, ci, k) in c.items(): print("%s|%s|%d|%d" % (cc, n, len(ci), k))
+elif mode == 'cities':
+    c = collections.OrderedDict()
+    for r in rel:
+        if r['country_code'] == a[0]:
+            e = c.setdefault(r['city_code'], [r['city_name'], 0, 0, 0]); e[1] += 1; e[2] += r['owned']; e[3] = max(e[3], r['network_port_speed'])
+    for code, (n, k, o, s) in c.items(): print("%s|%s|%d|%d|%d" % (code, n, k, o, s))
+elif mode == 'servers':
+    for r in rel:
+        if r['country_code'] == a[0] or loc(r) == a[0]:
+            print("%s|%s|%s|%d" % (r['hostname'], r['city_name'], own(r), r['network_port_speed']))
+elif mode == 'pick':
+    t = a[0].lower()
+    pick = [r for r in rel if r['hostname'] == t] or [r for r in rel if loc(r) == t or r['country_code'] == t]
+    if not pick: sys.exit("no active server for '%s'" % t)
+    r = random.choice(pick); print(r['hostname'], r['ipv4_addr_in'], r['pubkey'])
+elif mode == 'byip':
+    for r in rel:
+        if r['ipv4_addr_in'] == a[0]: print(r['hostname']); break
+elif mode == 'describe':
+    for r in rel:
+        if r['hostname'] == a[0]: print("%s, %s (%s) · %s · %d Gbps" % (r['city_name'], r['country_name'], r['hostname'], own(r), r['network_port_speed'])); break
+PY
+}
+
+pick_relay() { rq pick "$1"; }
+
+current_host() {   # hostname of the server the namespace is connected to right now (empty if down)
+  ns_exists || return 0
+  local ip; ip="$(in_ns wg show "$IF" endpoints | awk '{split($2, a, ":"); print a[1]; exit}')"
+  if [ -n "$ip" ]; then rq byip "$ip"; fi
+}
+
+# ---- the key: one conf file (PrivateKey, Address, DNS), default ~/.config/vpn-ns/mullvad.conf, or a path of your choice
+KT_SRC=$(cat <<'PY'
+import base64, ipaddress, os, sys
+
+def die(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(1)
+
+def read_conf(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            text = f.read(65536)
+    except OSError as e:
+        die("cannot read %s: %s" % (path, e.strerror))
+    sec, d = None, {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            sec = line.strip("[]").strip().lower()
+        elif "=" in line and sec == "interface":
+            k, v = line.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+
+def check_key(k):
+    try:
+        raw = base64.b64decode(k, validate=True)
+    except Exception:
+        die("the private key is not valid (a WireGuard key is 44 characters and ends in =)")
+    if len(raw) != 32:
+        die("the private key must be 44 characters long (32 bytes)")
+    return k
+
+def check_addr(a):
+    v4 = [x.strip() for x in a.split(",") if x.strip() and ":" not in x]
+    if not v4:
+        die("no IPv4 tunnel address found (a line like Address = 10.x.x.x/32)")
+    try:
+        return str(ipaddress.ip_interface(v4[0]))
+    except ValueError:
+        die("invalid tunnel address: %s" % v4[0])
+
+def check_dns(d):
+    try:
+        return str(ipaddress.ip_address((d or "10.64.0.1").split(",")[0].strip()))
+    except ValueError:
+        die("invalid DNS address: %s" % d)
+
+mode = sys.argv[1]
+if mode == "check":
+    c = read_conf(sys.argv[2])
+    check_key(c.get("privatekey", ""))
+    print("%s|%s" % (check_addr(c.get("address", "")), check_dns(c.get("dns"))))
+elif mode == "getkey":
+    print(check_key(read_conf(sys.argv[2]).get("privatekey", "")))
+elif mode == "store":
+    dest, opts = sys.argv[2], sys.argv[3:]
+    if opts and opts[0] == "--from":
+        c = read_conf(opts[1])
+        key, addr, dns = c.get("privatekey", ""), c.get("address", ""), c.get("dns")
+    else:
+        o = dict(zip(opts[::2], opts[1::2]))
+        key, addr, dns = sys.stdin.readline().strip(), o.get("--address", ""), o.get("--dns")
+    key, addr, dns = check_key(key), check_addr(addr), check_dns(dns)
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    tmp = dest + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("[Interface]\n# stored by vpn-ns\nPrivateKey = %s\nAddress = %s\nDNS = %s\n" % (key, addr, dns))
+    os.replace(tmp, dest)
+    os.chmod(dest, 0o600)
+    print("%s|%s" % (dest, addr))
+PY
+)
+kt() { python3 -I -c "$KT_SRC" "$@"; }
+
+key_conf() { local p=""; if [ -s "$POINTER" ]; then p="$(head -n1 "$POINTER")"; fi; echo "${p:-$DEFAULT_KEY}"; }
+addr() { kt check "$(key_conf)" | cut -d'|' -f1; }
+dns()  { kt check "$(key_conf)" | cut -d'|' -f2; }
+
+key_status() {   # always exit 0; first field says what is wrong
+  local f out; f="$(key_conf)"
+  if [ ! -f "$f" ]; then echo "missing|$f|"; return 0; fi
+  if out="$(kt check "$f" 2>&1)"; then echo "ok|$f|${out%%|*}"; else echo "invalid|$f|$out"; fi
+}
+
+dest_path() {   # --to value -> absolute file path (a directory gets mullvad.conf appended)
+  local t="${1:-}"
+  if [ -z "$t" ]; then echo "$DEFAULT_KEY"; return; fi
+  t="${t/#\~/$HOME}"; t="$(readlink -m -- "$t")"
+  if [ -d "$t" ]; then t="$t/mullvad.conf"; fi
+  echo "$t"
+}
+
+apply_key_live() {   # a running tunnel takes the new key/address without restarting the apps inside
+  if [ -n "${VPN_NS_NO_APPLY:-}" ] || ! ns_exists; then return 0; fi
+  in_ns wg set "$IF" private-key /dev/stdin <<<"$(kt getkey "$(key_conf)")"
+  in_ns ip addr flush dev "$IF"
+  in_ns ip addr add "$(addr)" dev "$IF"
+  in_ns ip route replace default dev "$IF"   # the flush above removes the default route
+  echo "nameserver $(dns)" | sudo tee "/etc/netns/$NS/resolv.conf" >/dev/null
+}
+
+key_store() {   # import <file> | set --address A [--dns D]   (+ --to PATH); 'set' reads the private key from stdin
+  local mode="$1"; shift
+  local src="" a="" d="" to="" old dest res
+  if [ "$mode" = import ]; then src="${1:-}"; [ -f "$src" ] || die "import needs the path of a Mullvad .conf file"; shift; fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) to="${2:-}"; shift 2;;
+      --address) a="${2:-}"; shift 2;;
+      --dns) d="${2:-}"; shift 2;;
+      *) die "unknown option: $1";;
+    esac
+  done
+  old="$(key_conf)"; dest="$(dest_path "$to")"
+  if [ "$mode" = import ]; then res="$(kt store "$dest" --from "$src")" || exit 1
+  else res="$(kt store "$dest" --address "$a" --dns "$d")" || exit 1; fi
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  if [ "$dest" = "$DEFAULT_KEY" ]; then rm -f "$POINTER"; else echo "$dest" > "$POINTER"; chmod 600 "$POINTER"; fi
+  if [ "$old" != "$dest" ] && [ -f "$old" ]; then rm -f "$old"; fi   # no stale copy of the secret at the old place
+  apply_key_live
+  echo "ok|$res"
+}
+
+key_remove() {
+  local f; f="$(key_conf)"
+  rm -f "$f" "$POINTER"
+  echo "removed|$f"
+}
+
+cmd_key() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    status) key_status;;
+    where) key_conf;;
+    import|set) key_store "$sub" "$@";;
+    remove) key_remove;;
+    *) die "key: status | where | import <file.conf> [--to PATH] | set --address A [--dns D] [--to PATH] | remove";;
+  esac
+}
+
+cmd_browse() {   # native file chooser; prints the chosen path (exit 1 if cancelled or no dialog tool)
+  local kind="${1:-file}" start="${2:-$HOME}"
+  if command -v kdialog >/dev/null; then
+    case "$kind" in
+      dir) kdialog --getexistingdirectory "$start";;
+      save) kdialog --getsavefilename "$start" "*.conf|WireGuard config";;
+      *) kdialog --getopenfilename "$start" "*.conf *.cfg *.txt|WireGuard config";;
+    esac
+  elif command -v zenity >/dev/null; then
+    case "$kind" in
+      dir) zenity --file-selection --directory --filename "$start/";;
+      save) zenity --file-selection --save --filename "$start";;
+      *) zenity --file-selection --filename "$start/" --title "Select the Mullvad WireGuard .conf";;
+    esac
+  else
+    die "no file dialog found (install kdialog or zenity), type the path instead"
+  fi
+}
+
+cmd_up() {
+  local ks; ks="$(key_status)"
+  case "$ks" in ok\|*) ;; *) die "no valid Mullvad key ($ks): use the app's Key setup or 'vpn-ns key import <file.conf>'";; esac
+  local target="${1:-$( [ -s "$LAST" ] && cat "$LAST" || echo "$DEFAULT_TARGET")}"
+  if ns_exists; then echo "namespace already up"; [ $# -gt 0 ] && cmd_switch "$target"; return; fi
+  local relay; relay="$(pick_relay "$target")"
+  sudo mkdir -p "/etc/netns/$NS"
+  echo "nameserver $(dns)" | sudo tee "/etc/netns/$NS/resolv.conf" >/dev/null
+  sudo ip netns add "$NS"
+  # the WireGuard socket is created in the main namespace, then the interface moves into "vpn"
+  sudo ip link add "$IF" type wireguard
+  sudo ip link set "$IF" netns "$NS"
+  in_ns ip link set lo up
+  in_ns ip addr add "$(addr)" dev "$IF"
+  in_ns wg set "$IF" private-key /dev/stdin <<<"$(kt getkey "$(key_conf)")"
+  in_ns ip link set "$IF" mtu 1380 up
+  in_ns ip route add default dev "$IF"
+  echo 1 | in_ns tee /proc/sys/net/ipv6/conf/all/disable_ipv6 >/dev/null
+  apply_relay $relay
+  echo "$target" > "$LAST"
+  echo "up: $relay" | awk '{print $1, $2, $3}'
+}
+
+apply_relay() {   # hostname ip pubkey
+  local host="$1" ip="$2" pub="$3" old
+  in_ns wg set "$IF" peer "$pub" endpoint "$ip:$PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+  for old in $(in_ns wg show "$IF" peers); do
+    [ "$old" = "$pub" ] || in_ns wg set "$IF" peer "$old" remove
+  done
+  echo "server: $host ($ip:$PORT)"
+}
+
+cmd_switch() {
+  [ $# -eq 1 ] || die "switch needs a target (country code, city or hostname)"
+  ns_exists || { cmd_up "$1"; return; }
+  apply_relay $(pick_relay "$1")
+  echo "$1" > "$LAST"
+}
+
+cmd_down() {
+  ns_exists || { echo "namespace not up"; return; }
+  local pids; pids="$(sudo ip netns pids "$NS" | tr '\n' ' ')"
+  if [ -n "${pids// /}" ] && [ "${1:-}" != force ]; then
+    die "apps are still running inside the VPN namespace (pids: $pids): close them first, or use 'vpn-ns down force' (they would lose their connection)"
+  fi
+  sudo ip netns del "$NS"
+  echo "down"
+}
+
+cmd_status() {
+  ns_exists || { echo "namespace '$NS' is not up"; return 1; }
+  in_ns wg show "$IF" | sed -E '/private key/d'
+  echo "--- exit IP as seen from inside the namespace:"
+  in_ns curl -fsS --max-time 15 https://am.i.mullvad.net/json | python3 -I -c '
+import json,sys; d=json.load(sys.stdin)
+for k in ("ip","country","city","mullvad_exit_ip","mullvad_exit_ip_hostname"): print(" ", k+":", d.get(k))'
+}
+
+cmd_list() {   # list = countries; list <cc> = cities; list <cc-city> = servers with owned/rented and speed
+  local a b c d e
+  case "${1:-}" in
+    '') while IFS='|' read -r a b c d; do printf '%-4s %-26s %2s cities  %3s servers\n' "$a" "$b" "$c" "$d"; done < <(rq countries);;
+    *-*) while IFS='|' read -r a b c d; do printf '%-18s %-18s %-26s %s Gbps\n' "$a" "$b" "$c" "$d"; done < <(rq servers "$1");;
+    *) while IFS='|' read -r a b c d e; do printf '%-4s %-18s %3s servers  %3s Mullvad-owned  up to %s Gbps\n' "$1-$a" "$b" "$c" "$d" "$e"; done < <(rq cities "$1");;
+  esac
+}
+
+exit_info() {   # "City, Country (server)" as seen from inside the namespace
+  in_ns curl -fsS --max-time 15 https://am.i.mullvad.net/json | python3 -I -c '
+import json,sys; d=json.load(sys.stdin)
+print("%s, %s (%s)" % (d.get("city"), d.get("country"), d.get("mullvad_exit_ip_hostname")))'
+}
+
+# --- country picker (KDE kdialog): country -> city -> server; cancel = one step back ---
+dlg_menu() { kdialog --title "Mullvad VPN" --menu "$@"; }
+
+dlg_countries() {   # $1 = current hostname; prints the chosen country code
+  local cur="${1%%-*}" cc name nc ns mark; local -a args=()
+  while IFS='|' read -r cc name nc ns; do
+    mark=""; if [ "$cc" = "$cur" ]; then mark="● "; fi
+    args+=("$cc" "$mark$name   ($nc cities, $ns servers)")
+  done < <(rq countries)
+  dlg_menu "Exit country for the VPN apps${1:+  -  connected now: $1}" "${args[@]}"
+}
+
+dlg_cities_servers() {   # $1 = country code, $2 = current hostname; prints a target for switch; rc 1 = back
+  local cc="$1" curloc="${2%-wg-*}" code name k o s mark host city owned spd choice target
+  local c; local -a cities=() servers=()
+  while IFS='|' read -r code name k o s; do cities+=("$code|$name|$k|$o|$s"); done < <(rq cities "$cc")
+  while :; do
+    if [ "${#cities[@]}" -eq 1 ]; then
+      IFS='|' read -r code name k o s <<<"${cities[0]}"
+    else
+      local -a args=("_any" "Any city in this country (random server)")
+      for c in "${cities[@]}"; do
+        IFS='|' read -r code name k o s <<<"$c"
+        mark=""; if [ "$cc-$code" = "$curloc" ]; then mark="● "; fi
+        args+=("$code" "$mark$name   ($k servers, $o Mullvad-owned, up to $s Gbps)")
+      done
+      choice="$(dlg_menu "City:" "${args[@]}")" || return 1
+      if [ "$choice" = "_any" ]; then echo "$cc"; return 0; fi
+      code="$choice"
+    fi
+    servers=("_any" "Random server in this city")
+    while IFS='|' read -r host city owned spd; do
+      mark=""; if [ "$host" = "$2" ]; then mark="● "; fi
+      servers+=("$host" "$mark$host   $owned   $spd Gbps")
+    done < <(rq servers "$cc-$code")
+    if choice="$(dlg_menu "Server:" "${servers[@]}")"; then
+      if [ "$choice" = "_any" ]; then echo "$cc-$code"; else echo "$choice"; fi
+      return 0
+    fi
+    if [ "${#cities[@]}" -eq 1 ]; then return 1; fi
+  done
+}
+
+cmd_pick() {
+  command -v kdialog >/dev/null || die "kdialog is not installed"
+  local cur cc target out host info
+  cur="$(current_host)"
+  while :; do
+    cc="$(dlg_countries "$cur")" || return 0
+    if target="$(dlg_cities_servers "$cc" "$cur")"; then break; fi
+  done
+  if out="$(cmd_switch "$target" 2>&1 | sed -n 1p)"; then
+    sleep 3
+    host="$(current_host)"
+    if exit_info >/dev/null 2>&1; then info="$(rq describe "$host")"; else info="$(rq describe "$host") (still connecting, check again)"; fi
+    kdialog --title "Mullvad VPN" --passivepopup "Switched: $info" 8
+  else
+    kdialog --title "Mullvad VPN" --error "Switch to '$target' failed:\n$out"
+  fi
+}
+
+cmd_run() {
+  [ $# -ge 1 ] || die "run needs a command"
+  ns_exists || cmd_up
+  in_ns setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups --bounding-set=-all --inh-caps=-all -- \
+    env HOME="$HOME" USER="$USER" LOGNAME="$USER" PATH="$PATH" \
+        DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+        LANG="${LANG:-C.UTF-8}" "$@"
+}
+
+# ---- the list of apps that use the VPN: name|Menu title|command and arguments ({conf} = ~/.config/vpn-ns)|icon
+AP_SRC=$(cat <<'PY'
+import configparser, glob, os, re, shlex, shutil, sys
+
+HOME = os.path.expanduser("~")
+FIREFOX = ("firefox", "librewolf", "waterfox", "zen", "icecat")
+CHROMIUM = ("google-chrome", "chromium", "brave", "microsoft-edge", "vivaldi", "opera")
+
+def clean(x):
+    return x.replace("|", "/").strip()
+
+def parse_desktop(path):
+    d, in_entry = {}, False
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    if in_entry:
+                        break
+                    in_entry = line == "[Desktop Entry]"
+                elif in_entry and "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    if "[" not in k:
+                        d[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return d
+
+mode = sys.argv[1]
+if mode == "scan":
+    dirs = ["/usr/share/applications", "/usr/local/share/applications", "/var/lib/snapd/desktop/applications",
+            "/var/lib/flatpak/exports/share/applications", HOME + "/.local/share/flatpak/exports/share/applications",
+            HOME + "/.local/share/applications"]
+    apps = {}
+    for dr in dirs:
+        for path in glob.glob(dr + "/*.desktop"):
+            base = os.path.basename(path)
+            d = parse_desktop(path)
+            if d.get("Type") != "Application" or "Exec" not in d or "Name" not in d:
+                continue
+            if d.get("NoDisplay", "").lower() == "true" or d.get("Hidden", "").lower() == "true" or d.get("Terminal", "").lower() == "true":
+                continue
+            if base.startswith("vpn-") or d.get("X-VPN-NS") or d["Name"].startswith("Mullvad VPN"):
+                continue
+            apps[base] = d
+    seen, rows = set(), []
+    for base, d in apps.items():
+        ex = re.sub(r"\s*%[a-zA-Z]", "", d["Exec"]).replace("%%", "%").strip()
+        key = (d["Name"], ex)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((d["Name"], "%s|%s|%s|%s" % (clean(base[:-8]), clean(d["Name"]), clean(ex), clean(d.get("Icon", "")))))
+    for _, row in sorted(rows, key=lambda r: r[0].casefold()):
+        print(row)
+elif mode == "isolate":      # name command  ->  "final command|note"
+    name, cmd = sys.argv[2], sys.argv[3]
+    try:
+        first = os.path.basename(shlex.split(cmd)[0])
+    except (ValueError, IndexError):
+        print("|The command is empty or has unbalanced quotes.")
+        sys.exit(0)
+    prof = "{conf}/profiles/" + name
+    if first.startswith(FIREFOX) and "--profile" not in cmd:
+        print("%s --no-remote --profile %s|Started with its own profile, so it does not reuse a Firefox that is open outside the VPN." % (cmd, prof))
+    elif first.startswith(CHROMIUM) and "--user-data-dir" not in cmd:
+        print("%s --user-data-dir=%s|Started with its own profile, so it does not reuse a browser window that is open outside the VPN." % (cmd, prof))
+    else:
+        print("%s|If this app is already open outside the VPN, a second start may just reuse that window and stay outside the VPN. Close it first, and check the running-in-VPN marker." % cmd)
+elif mode == "parse":        # command conf  ->  NUL separated arguments
+    sys.stdout.write("\0".join(shlex.split(sys.argv[2].replace("{conf}", shlex.quote(sys.argv[3])))))
+elif mode == "status":       # appsfile conf pid...  ->  name|1 (runs inside the VPN) or name|0
+    appsfile, conf, pids = sys.argv[2], sys.argv[3], sys.argv[4:]
+    procs = []
+    for pid in pids:
+        try:
+            cl = open("/proc/%s/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        try:
+            exe = os.path.basename(os.path.realpath("/proc/%s/exe" % pid))
+        except OSError:
+            exe = ""
+        procs.append((cl, exe))
+    for line in open(appsfile, errors="replace"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        f = line.rstrip("\n").split("|")
+        if len(f) < 3:
+            continue
+        try:
+            parts = shlex.split(f[2].replace("{conf}", shlex.quote(conf)))
+        except ValueError:
+            parts = f[2].split()
+        real = os.path.basename(os.path.realpath(shutil.which(parts[0]) or parts[0])) if parts else ""
+        marks = [x for x in parts[1:] if conf in x]
+        run = any((marks and any(m.split("=")[-1] in cl for m in marks)) or (real and exe == real) for cl, exe in procs)
+        print("%s|%d" % (f[0], 1 if run else 0))
+PY
+)
+ap() { python3 -I -c "$AP_SRC" "$@"; }
+
+apps_init() {
+  if [ ! -f "$APPS" ]; then
+    mkdir -p "$CONF_DIR"
+    if [ -f "$SEED_APPS" ]; then cp "$SEED_APPS" "$APPS"; else : > "$APPS"; fi
+  fi
+}
+
+app_line() { grep -E "^$1\|" "$APPS" | head -1 || true; }
+
+cmd_app() {
+  [ $# -eq 1 ] || die "app needs a name from the apps list"
+  apps_init
+  local line cmdstr; line="$(app_line "$1")"; [ -n "$line" ] || die "'$1' is not in $APPS"
+  cmdstr="$(echo "$line" | cut -d'|' -f3)"
+  mkdir -p "$CONF_DIR/profiles"
+  local -a argv=()
+  mapfile -d '' -t argv < <(ap parse "$cmdstr" "$CONF_DIR")
+  [ "${#argv[@]}" -gt 0 ] || die "empty command for '$1'"
+  cmd_run "${argv[@]}"
+}
+
+cmd_apps() {
+  apps_init
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    list) grep -vE '^[[:space:]]*(#|$)' "$APPS" || true;;
+    scan) ap scan;;
+    status)
+      local pids=""
+      if ns_exists; then pids="$(sudo ip netns pids "$NS" | tr '\n' ' ')"; fi
+      # shellcheck disable=SC2086
+      ap status "$APPS" "$CONF_DIR" $pids;;
+    add)
+      [ $# -ge 3 ] || die "apps add <name> <title> <command> [icon]"
+      local name="$1" title="$2" cmd="$3" icon="${4:-}"
+      [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "the app name may only use lower-case letters, digits, - and _"
+      case "$title$cmd$icon" in *'|'*) die "no | character allowed in the fields";; esac
+      if grep -qE "^$name\|" "$APPS"; then die "'$name' is already in the list"; fi
+      local res final note; res="$(ap isolate "$name" "$cmd")"; final="${res%%|*}"; note="${res#*|}"
+      [ -n "$final" ] || die "$note"
+      printf '%s|%s|%s|%s\n' "$name" "$title" "$final" "$icon" >> "$APPS"
+      launchers_apps >/dev/null
+      echo "ok|$final|$note";;
+    remove)
+      [ $# -eq 1 ] || die "apps remove <name>"
+      [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "invalid app name"
+      { grep -vE "^$1\|" "$APPS" || true; } > "$APPS.tmp" && mv "$APPS.tmp" "$APPS"
+      rm -f "$DESKTOP_DIR/vpn-$1.desktop"
+      echo "removed|$1";;
+    *) die "apps: list | scan | status | add <name> <title> <command> [icon] | remove <name>";;
+  esac
+}
+
+launchers_apps() {   # one menu entry per VPN app; entries of removed apps disappear
+  apps_init
+  local f name title cmd icon
+  mkdir -p "$DESKTOP_DIR"
+  for f in "$DESKTOP_DIR"/vpn-*.desktop; do
+    [ -e "$f" ] || continue
+    if grep -q '^X-VPN-NS=app' "$f"; then rm -f "$f"; fi
+  done
+  while IFS='|' read -r name title cmd icon; do
+    case "$name" in ''|'#'*) continue;; esac
+    cat > "$DESKTOP_DIR/vpn-$name.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$title
+Comment=Runs through the Mullvad VPN namespace (vpn-ns)
+Exec=$HERE/vpn-ns app $name
+Icon=${icon:-$name}
+Terminal=false
+Categories=Network;
+X-VPN-NS=app
+DESKTOP
+    echo "created $DESKTOP_DIR/vpn-$name.desktop"
+  done < "$APPS"
+}
+
+launchers_pickers() {   # the two picker windows: menu entry + Desktop icon
+  local kind title2 exec2 f
+  mkdir -p "$DESKTOP_DIR"
+  for kind in rust python; do
+    if [ "$kind" = rust ]; then title2="Mullvad VPN (Rust)"; exec2="$HERE/vpn-ns-gui"; else title2="Mullvad VPN (Python)"; exec2="$HERE/vpn-ns-qt"; fi
+    [ -x "$exec2" ] || continue
+    f="$DESKTOP_DIR/vpn-picker-$kind.desktop"
+    cat > "$f" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$title2
+Comment=Choose the Mullvad server (country, city, server) of the VPN apps
+Exec=$exec2
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+DESKTOP
+    if [ -d "$HOME/Desktop" ] && [ -z "${VPN_NS_DESKTOP_DIR:-}" ]; then
+      cp "$f" "$HOME/Desktop/Mullvad-VPN-$kind.desktop"
+      chmod +x "$HOME/Desktop/Mullvad-VPN-$kind.desktop"
+    fi
+    echo "created $title2 (menu entry + ~/Desktop/Mullvad-VPN-$kind.desktop)"
+  done
+  rm -f "$DESKTOP_DIR/vpn-country-picker.desktop" "$HOME/Desktop/Mullvad-VPN-country.desktop"
+}
+
+cmd_launchers() { launchers_apps; launchers_pickers; }
+
+case "${1:-}" in
+  init) shift; cmd_key import "$@";;
+  key) shift; cmd_key "$@";;
+  browse) shift; cmd_browse "$@";;
+  up) shift; cmd_up "$@";;
+  switch) shift; cmd_switch "$@";;
+  down) shift; cmd_down "$@";;
+  status) cmd_status;;
+  list) shift; cmd_list "$@";;
+  pick) cmd_pick;;
+  current) current_host;;
+  refresh) relays_refresh "${2:-}";;
+  run) shift; cmd_run "$@";;
+  app) shift; cmd_app "$@";;
+  launchers) cmd_launchers;;
+  apps) shift; cmd_apps "$@";;
+  *) usage; exit 1;;
+esac

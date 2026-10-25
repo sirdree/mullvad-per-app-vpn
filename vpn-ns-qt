@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""vpn-ns-qt: Python/Qt6 server picker for the vpn-ns Mullvad namespace.
+
+Countries (flags) > cities > servers (owned/rented, provider, Gbps), live search, one click switches.
+Same features as the Rust version (vpn-ns-gui), but edit-and-reopen: no compile step.
+All VPN work is done by the `vpn-ns` script next to this file; this program is only the front end.
+Needs: python3-pyqt6 (apt).
+"""
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+from PyQt6.QtCore import QProcess, QSettings, QSize, Qt, QTimer
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
+                             QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                             QPushButton, QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = Path(os.environ.get("VPN_NS", HERE / "vpn-ns"))
+FLAGS = next((d for d in (HERE / "flags", HERE / "rust" / "flags", HERE / "vpn-ns-picker" / "flags") if d.is_dir()), HERE / "flags")
+SERVERS = Path.home() / ".config/vpn-ns/servers.json"
+
+GREEN = QColor(70, 180, 100)
+AMBER = QColor(214, 158, 46)
+RED = QColor(220, 80, 70)
+TINT = QBrush(QColor(70, 180, 100, 45))
+NO_BRUSH = QBrush()
+
+ROLE_TARGET = Qt.ItemDataRole.UserRole + 1   # what `vpn-ns switch` gets
+ROLE_LABEL = Qt.ItemDataRole.UserRole + 2    # text for the status bar
+ROLE_KIND = Qt.ItemDataRole.UserRole + 3     # country | city | server
+
+
+def owner_text(r):
+    return "Mullvad-owned" if r["owned"] else f"rented · {r['provider']}"
+
+
+def age_text(path):
+    try:
+        s = time.time() - path.stat().st_mtime
+    except OSError:
+        return "list age unknown"
+    if s < 60:
+        return "list updated just now"
+    if s < 3600:
+        return f"list updated {int(s // 60)} min ago"
+    if s < 86400:
+        return f"list updated {int(s // 3600)} h ago"
+    return f"list updated {int(s // 86400)} d ago"
+
+
+class KeyDialog(QDialog):
+    """Mullvad key setup: import a .conf, or type the key; choose where it is stored."""
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle("Mullvad key setup")
+        self.setMinimumWidth(640)
+        lay = QVBoxLayout(self)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.RichText)
+        note = QLabel("The key stays on this computer, in a file only you can read.")
+        note.setStyleSheet("color: gray;")
+        lay.addWidget(self.status)
+        lay.addWidget(note)
+
+        self.tabs = QTabWidget()
+        t1 = QWidget()
+        l1 = QVBoxLayout(t1)
+        hint = QLabel("Get the file in your Mullvad account: WireGuard configuration > Linux > Generate key > Download file.")
+        hint.setWordWrap(True)
+        l1.addWidget(hint)
+        r1 = QHBoxLayout()
+        self.path = QLineEdit()
+        self.path.setPlaceholderText("/path/to/mullvad.conf")
+        b1 = QPushButton("Browse…")
+        b1.clicked.connect(self.browse_import)
+        r1.addWidget(self.path, 1)
+        r1.addWidget(b1)
+        l1.addLayout(r1)
+        l1.addStretch(1)
+
+        t2 = QWidget()
+        l2 = QVBoxLayout(t2)
+        hint2 = QLabel("The WireGuard private key (44 characters) and the tunnel address Mullvad assigned to it.")
+        hint2.setWordWrap(True)
+        l2.addWidget(hint2)
+        r2 = QHBoxLayout()
+        self.private = QLineEdit()
+        self.private.setEchoMode(QLineEdit.EchoMode.Password)
+        self.private.setPlaceholderText("private key")
+        show = QCheckBox("show")
+        show.toggled.connect(lambda on: self.private.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        r2.addWidget(self.private, 1)
+        r2.addWidget(show)
+        l2.addLayout(r2)
+        self.address = QLineEdit()
+        self.address.setPlaceholderText("tunnel address, e.g. 10.64.12.34/32")
+        l2.addWidget(self.address)
+        l2.addStretch(1)
+        self.tabs.addTab(t1, "Import a Mullvad .conf file")
+        self.tabs.addTab(t2, "Enter the key by hand")
+        lay.addWidget(self.tabs)
+
+        lay.addWidget(QLabel("Store the key at (a folder gets mullvad.conf inside):"))
+        r3 = QHBoxLayout()
+        self.store = QLineEdit()
+        b3 = QPushButton("Browse…")
+        b3.clicked.connect(self.browse_store)
+        r3.addWidget(self.store, 1)
+        r3.addWidget(b3)
+        lay.addLayout(r3)
+
+        btns = QHBoxLayout()
+        self.btn_save = QPushButton("Save key")
+        self.btn_save.clicked.connect(self.save)
+        self.btn_delete = QPushButton("Delete stored key")
+        self.btn_delete.clicked.connect(self.delete)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_delete)
+        btns.addStretch(1)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+        self.msg = QLabel()
+        self.msg.setWordWrap(True)
+        lay.addWidget(self.msg)
+        self.refresh()
+
+    def set_msg(self, text, error=False):
+        self.msg.setText(text)
+        self.msg.setStyleSheet(f"color: {(RED if error else GREEN).name()};")
+
+    def refresh(self):
+        m = self.main
+        if m.key_ok:
+            self.status.setText(f'<span style="color:{GREEN.name()}">Key stored at {m.key_path} (tunnel address {m.key_addr})</span>')
+        else:
+            self.status.setText(f'<b style="color:{AMBER.name()}">{m.key_problem}</b>')
+        if m.key_path and (not self.store.text() or m.key_ok):
+            self.store.setText(m.key_path)
+        self.btn_delete.setVisible(m.key_ok)
+
+    def browse_import(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Select the Mullvad WireGuard .conf", str(Path.home()),
+                                           "WireGuard config (*.conf *.cfg *.txt);;All files (*)")
+        if p:
+            self.path.setText(p)
+
+    def browse_store(self):
+        start = self.store.text() or str(Path.home() / "mullvad.conf")
+        p, _ = QFileDialog.getSaveFileName(self, "Store the key at", start, "WireGuard config (*.conf);;All files (*)",
+                                           options=QFileDialog.Option.DontConfirmOverwrite)
+        if p:
+            self.store.setText(p)
+
+    def save(self):
+        if self.tabs.currentIndex() == 0:
+            if not self.path.text().strip():
+                self.set_msg("Choose the .conf file first.", error=True)
+                return
+            args, stdin = ["key", "import", os.path.expanduser(self.path.text().strip())], None
+        else:
+            if not self.private.text().strip() or not self.address.text().strip():
+                self.set_msg("Enter the private key and the tunnel address.", error=True)
+                return
+            args, stdin = ["key", "set", "--address", self.address.text().strip()], self.private.text().strip() + "\n"
+        if self.store.text().strip():
+            args += ["--to", os.path.expanduser(self.store.text().strip())]
+        self.btn_save.setEnabled(False)
+        self.set_msg("Saving…")
+
+        def done(ok, out, err):
+            self.btn_save.setEnabled(True)
+            if ok:
+                self.private.clear()
+                self.main.apply_key_status(out)
+                self.set_msg("Key saved. A running tunnel uses it at once; otherwise it is used when you connect.")
+            else:
+                self.set_msg(err, error=True)
+
+        self.main.run(args, done, stdin=stdin)
+
+    def delete(self):
+        if QMessageBox.question(self, "Delete stored key", "Delete the stored Mullvad key from this computer?") != QMessageBox.StandardButton.Yes:
+            return
+
+        def done(ok, out, err):
+            self.main.check_key()
+            self.set_msg("Key deleted." if ok else err, error=not ok)
+
+        self.main.run(["key", "remove"], done)
+
+
+class AppsDialog(QDialog):
+    """The apps that start through the VPN: launch, remove, add from the installed apps or by command."""
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle("VPN apps")
+        self.resize(760, 700)
+        self.rows = {}          # name -> (dot, running label)
+        self.names = []
+        self.installed_loaded = False
+        self.items = []
+        self.running = set()
+        lay = QVBoxLayout(self)
+        intro = QLabel("These apps always start through the Mullvad VPN. Everything else keeps your normal connection.")
+        intro.setStyleSheet("color: gray;")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setMinimumHeight(150)
+        self.inner = QWidget()
+        self.rows_lay = QVBoxLayout(self.inner)
+        self.rows_lay.addStretch(1)
+        self.scroll.setWidget(self.inner)
+        lay.addWidget(self.scroll, 1)
+
+        self.tabs = QTabWidget()
+        t1 = QWidget()
+        l1 = QVBoxLayout(t1)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter installed apps…")
+        self.filter.textChanged.connect(self.apply_filter)
+        self.installed = QListWidget()
+        self.installed.itemDoubleClicked.connect(lambda _i: self.add_installed())
+        self.btn_add_inst = QPushButton("Add selected app")
+        self.btn_add_inst.clicked.connect(self.add_installed)
+        l1.addWidget(self.filter)
+        l1.addWidget(self.installed, 1)
+        l1.addWidget(self.btn_add_inst)
+        t2 = QWidget()
+        form = QFormLayout(t2)
+        self.c_name = QLineEdit()
+        self.c_name.setPlaceholderText("lower-case letters, digits, - and _ (e.g. telegram)")
+        self.c_title = QLineEdit()
+        self.c_title.setPlaceholderText("menu title (e.g. Telegram (VPN))")
+        self.c_cmd = QLineEdit()
+        self.c_cmd.setPlaceholderText("command (e.g. telegram-desktop)")
+        self.c_icon = QLineEdit()
+        self.c_icon.setPlaceholderText("icon name (optional)")
+        form.addRow("Name", self.c_name)
+        form.addRow("Menu title", self.c_title)
+        form.addRow("Command", self.c_cmd)
+        form.addRow("Icon", self.c_icon)
+        btn = QPushButton("Add app")
+        btn.clicked.connect(self.add_custom)
+        form.addRow("", btn)
+        self.tabs.addTab(t1, "Add from installed apps")
+        self.tabs.addTab(t2, "Add a custom command")
+        lay.addWidget(self.tabs, 2)
+
+        self.msg = QLabel()
+        self.msg.setWordWrap(True)
+        lay.addWidget(self.msg)
+        self.timer = QTimer(self, interval=4000, timeout=self.refresh)
+
+    def set_msg(self, text, error=False):
+        self.msg.setText(text)
+        self.msg.setStyleSheet(f"color: {(RED if error else GREEN).name()};")
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.refresh()
+        self.timer.start()
+        if not self.installed_loaded:
+            self.installed_loaded = True
+            self.main.run(["apps", "scan"], self.scanned)
+
+    def hideEvent(self, e):
+        self.timer.stop()
+        super().hideEvent(e)
+
+    # ---- the list of VPN apps
+    def refresh(self):
+        def got_list(ok, out, _err):
+            items = []
+            for line in (out if ok else "").splitlines():
+                f = line.split("|", 3)
+                if len(f) >= 3:
+                    items.append({"name": f[0], "title": f[1], "cmd": f[2]})
+
+            def got_status(ok2, out2, _e):
+                running = {l.split("|")[0] for l in (out2 if ok2 else "").splitlines() if l.endswith("|1")}
+                self.apply(items, running)
+
+            self.main.run(["apps", "status"], got_status)
+
+        self.main.run(["apps", "list"], got_list)
+
+    def apply(self, items, running):
+        self.items, self.running = items, running
+        names = [i["name"] for i in items]
+        if names != self.names:
+            self.rebuild_rows()
+        for name, (dot, lab) in self.rows.items():
+            on = name in running
+            dot.setStyleSheet(f"color: {(GREEN if on else QColor(150, 150, 150)).name()};")
+            lab.setVisible(on)
+        self.apply_filter()
+
+    def rebuild_rows(self):
+        while self.rows_lay.count() > 1:
+            w = self.rows_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self.rows = {}
+        self.names = [i["name"] for i in self.items]
+        if not self.items:
+            empty = QLabel("No apps yet. Add one below.")
+            self.rows_lay.insertWidget(0, empty)
+        for pos, it in enumerate(self.items):
+            w = QFrame()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(4, 4, 4, 4)
+            top = QHBoxLayout()
+            dot = QLabel("●")
+            title = QLabel(f"<b>{it['title']}</b>")
+            run = QLabel("running in the VPN")
+            run.setStyleSheet(f"color: {GREEN.name()};")
+            run.setVisible(False)
+            launch = QPushButton("Launch")
+            remove = QPushButton("Remove")
+            top.addWidget(dot)
+            top.addWidget(title)
+            top.addWidget(run)
+            top.addStretch(1)
+            top.addWidget(launch)
+            top.addWidget(remove)
+            cmd = QLabel(it["cmd"])
+            cmd.setStyleSheet("color: gray; font-size: 9pt;")
+            v.addLayout(top)
+            v.addWidget(cmd)
+            launch.clicked.connect(lambda _=False, n=it["name"], t=it["title"]: self.launch(n, t))
+            remove.clicked.connect(lambda _=False, n=it["name"], b=remove: self.remove(n, b))
+            self.rows_lay.insertWidget(pos, w)
+            self.rows[it["name"]] = (dot, run)
+
+    def launch(self, name, title):
+        QProcess.startDetached(str(SCRIPT), ["app", name])
+        self.set_msg(f"Started {title} through the VPN.")
+
+    def remove(self, name, button):
+        if button.text() != "Really remove?":
+            button.setText("Really remove?")
+            QTimer.singleShot(4000, lambda: button.setText("Remove") if button else None)
+            return
+
+        def done(ok, _out, err):
+            self.set_msg("Removed." if ok else err, error=not ok)
+            self.refresh()
+
+        self.main.run(["apps", "remove", name], done)
+
+    # ---- adding
+    def scanned(self, ok, out, _err):
+        self.installed.clear()
+        for line in (out if ok else "").splitlines():
+            f = line.split("|", 3)
+            if len(f) == 4:
+                it = QListWidgetItem(f"{f[1]}      {f[2]}")
+                it.setData(Qt.ItemDataRole.UserRole, f)
+                self.installed.addItem(it)
+        self.apply_filter()
+
+    def apply_filter(self, *_):
+        t = self.filter.text().lower().strip()
+        firsts = {i["cmd"].split()[0] for i in self.items if i["cmd"].split()}
+        for n in range(self.installed.count()):
+            it = self.installed.item(n)
+            f = it.data(Qt.ItemDataRole.UserRole)
+            in_list = f[2].split()[0] in firsts if f[2].split() else False
+            it.setHidden(bool(t) and t not in it.text().lower())
+            if in_list and not it.text().endswith("(in the list)"):
+                it.setText(it.text() + "     (in the list)")
+            it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled if in_list else it.flags() | Qt.ItemFlag.ItemIsEnabled)
+
+    def add_installed(self):
+        it = self.installed.currentItem()
+        if not it:
+            self.set_msg("Select an app in the list first.", error=True)
+            return
+        f = it.data(Qt.ItemDataRole.UserRole)
+        name = re.sub(r"[^a-z0-9_-]", "-", f[0].lower()).lstrip("-_")
+        self.run_add([name, f"{f[1]} (VPN)", f[2], f[3]])
+
+    def add_custom(self):
+        self.run_add([self.c_name.text().strip(), self.c_title.text().strip(), self.c_cmd.text().strip(), self.c_icon.text().strip()])
+
+    def run_add(self, fields):
+        def done(ok, out, err):
+            if ok:
+                note = out.split("|", 2)[2] if out.count("|") >= 2 else ""
+                self.set_msg(f"Added. {note}")
+                for w in (self.c_name, self.c_title, self.c_cmd, self.c_icon):
+                    w.clear()
+                self.refresh()
+            else:
+                self.set_msg(err, error=True)
+
+        self.main.run(["apps", "add", *fields], done)
+
+
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mullvad VPN servers (Python)")
+        self.settings = QSettings("vpn-ns", "vpn-ns-qt")
+        self.base_font_pt = QApplication.font().pointSizeF()
+        self.zoom = float(self.settings.value("zoom", 1.0))
+        self.current = ""
+        self.busy = False
+        self.updating = False
+        self.was_searching = False
+        self.countries = []
+        self.by_host = {}
+        self.hits = 0
+        self.only_hit = None
+        self.procs = set()
+        self.key_ok, self.key_path, self.key_addr, self.key_problem = False, "", "", "Checking the key…"
+        self.key_prompted = False
+        self.key_dlg = None
+        self.apps_dlg = None
+        self.mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+
+        # --- top: connection line + search row
+        central = QWidget()
+        self.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(10, 8, 10, 4)
+
+        top = QHBoxLayout()
+        self.top_flag = QLabel()
+        self.top_text = QLabel()
+        self.top_text.setTextFormat(Qt.TextFormat.RichText)
+        top.addWidget(self.top_flag)
+        top.addWidget(self.top_text, 1)
+        self.btn_apps = QPushButton("VPN apps…")
+        self.btn_apps.setToolTip("Choose which apps start through the VPN")
+        self.btn_key = QPushButton("Key…")
+        self.btn_key.setToolTip("Set up, replace or delete your Mullvad key")
+        self.btn_down = QPushButton("Disconnect")
+        self.btn_down.setToolTip("Turn the VPN off. VPN apps lose their connection; everything else is unaffected")
+        self.btn_down.setEnabled(False)
+        self.btn_update = QPushButton("Update list")
+        self.btn_update.setToolTip("Download the current server list from Mullvad now (otherwise it refreshes once a day)")
+        btn_minus, btn_plus = QPushButton("A-"), QPushButton("A+")
+        for b in (btn_minus, btn_plus):
+            b.setFixedWidth(34)
+        btn_minus.setToolTip("Smaller (Ctrl and minus)")
+        btn_plus.setToolTip("Bigger (Ctrl and plus)")
+        for b in (self.btn_apps, self.btn_key, self.btn_down, self.btn_update, btn_minus, btn_plus):
+            top.addWidget(b)
+        lay.addLayout(top)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search country, city, server, provider…   (Esc clears)")
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search)
+
+        filters = QHBoxLayout()
+        self.owned = QCheckBox("Mullvad-owned only")
+        self.speed = QComboBox()
+        self.speed.addItem("any speed", 0)
+        filters.addWidget(self.owned)
+        filters.addSpacing(16)
+        filters.addWidget(QLabel("Speed:"))
+        filters.addWidget(self.speed)
+        filters.addStretch(1)
+        lay.addLayout(filters)
+
+        # --- tree
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Location", "Details", "Ownership", "Speed", ""])
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tree.setExpandsOnDoubleClick(False)
+        self.tree.setAnimated(False)
+        self.tree.setStyleSheet("QTreeWidget::item { padding: 3px 2px; } QTreeWidget::item:hover { background: rgba(128,128,128,50); }")
+        h = self.tree.header()
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.tree.setColumnWidth(0, 250)
+        self.tree.setColumnWidth(4, 100)
+        lay.addWidget(self.tree, 1)
+
+        # --- status bar
+        self.msg = QLabel()
+        self.count = QLabel()
+        self.statusBar().addWidget(self.msg, 1)
+        self.statusBar().addPermanentWidget(self.count)
+
+        # --- wiring
+        self.search.textChanged.connect(self.refresh_view)
+        self.search.returnPressed.connect(self.enter_pressed)
+        self.owned.toggled.connect(self.refresh_view)
+        self.speed.currentIndexChanged.connect(self.refresh_view)
+        self.btn_apps.clicked.connect(self.open_apps)
+        self.btn_key.clicked.connect(self.open_key)
+        self.btn_update.clicked.connect(self.update_list)
+        self.btn_down.clicked.connect(lambda: self.disconnect(False))
+        btn_minus.clicked.connect(lambda: self.set_zoom(self.zoom / 1.1))
+        btn_plus.clicked.connect(lambda: self.set_zoom(self.zoom * 1.1))
+        self.tree.itemClicked.connect(self.item_clicked)
+        QShortcut(QKeySequence("Escape"), self, activated=self.search.clear)
+        for k in ("Ctrl++", "Ctrl+="):
+            QShortcut(QKeySequence(k), self, activated=lambda: self.set_zoom(self.zoom * 1.1))
+        QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.set_zoom(self.zoom / 1.1))
+
+        self.poll_timer = QTimer(self, interval=4000, timeout=self.poll)
+        self.age_timer = QTimer(self, interval=30000, timeout=self.update_count)
+
+        geo = self.settings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1040, 820)
+        self.apply_zoom()
+        self.rebuild()
+        self.set_msg("Updating server list…")
+        self.run(["refresh"], self.after_startup_refresh)
+        self.poll()
+        self.check_key()
+        opener = os.environ.get("VPN_NS_GUI_OPEN")
+        if opener == "apps":
+            QTimer.singleShot(400, self.open_apps)
+        elif opener == "key":
+            QTimer.singleShot(400, self.open_key)
+        self.poll_timer.start()
+        self.age_timer.start()
+        self.search.setFocus()
+
+    # ---------------------------------------------------------------- helpers
+    def run(self, args, done, stdin=None):
+        p = QProcess(self)
+        p.setProgram(str(SCRIPT))
+        p.setArguments(args)
+        self.procs.add(p)
+
+        def fin(code, _status):
+            out = bytes(p.readAllStandardOutput()).decode(errors="replace").strip()
+            err = bytes(p.readAllStandardError()).decode(errors="replace").strip()
+            self.procs.discard(p)
+            p.deleteLater()
+            done(code == 0, out, err.splitlines()[0] if err else "failed")
+
+        p.finished.connect(fin)
+        if stdin is not None:
+            p.started.connect(lambda: (p.write(stdin.encode()), p.closeWriteChannel()))
+        p.start()
+
+    def set_msg(self, text, error=False):
+        self.msg.setText(text)
+        self.msg.setStyleSheet(f"color: {RED.name()};" if error else "")
+
+    def apply_zoom(self):
+        f = QApplication.font()
+        f.setPointSizeF(self.base_font_pt * self.zoom)
+        QApplication.setFont(f)
+        self.tree.setIconSize(QSize(round(24 * self.zoom), round(16 * self.zoom)))
+        self.tree.header().resizeSection(4, round(100 * self.zoom))
+
+    def set_zoom(self, z):
+        self.zoom = max(0.6, min(2.2, z))
+        self.apply_zoom()
+
+    def closeEvent(self, e):
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("zoom", self.zoom)
+        for p in list(self.procs):   # let a running poll/switch finish before the window goes away
+            p.waitForFinished(5000)
+        super().closeEvent(e)
+
+    # ---------------------------------------------------------------- data
+    def rebuild(self):
+        self.tree.clear()
+        self.countries = []
+        self.by_host = {}
+        try:
+            data = json.load(open(SERVERS))
+        except (OSError, ValueError) as e:
+            self.set_msg(f"Server list: {e}", error=True)
+            return
+        relays = sorted((r for r in data if r.get("active") and r.get("type", "wireguard") == "wireguard"),
+                        key=lambda r: (r["country_name"], r["city_name"], r["hostname"]))
+        speeds = sorted({r["network_port_speed"] for r in relays})
+        keep = self.speed.currentData() or 0
+        self.speed.blockSignals(True)
+        self.speed.clear()
+        self.speed.addItem("any speed", 0)
+        for sp in speeds:
+            self.speed.addItem(f"at least {sp} Gbps", sp)
+        self.speed.setCurrentIndex(max(self.speed.findData(keep), 0))
+        self.speed.blockSignals(False)
+        big = QFont(self.font())
+        big.setBold(True)
+        big.setPointSizeF(self.font().pointSizeF() + 1.5)
+        co = ci = None
+        for r in relays:
+            if co is None or co["code"] != r["country_code"]:
+                item = QTreeWidgetItem(self.tree)
+                item.setText(0, r["country_name"])
+                item.setFont(0, big)
+                flag = FLAGS / f"{r['country_code']}.png"
+                if flag.exists():
+                    item.setIcon(0, QIcon(QPixmap(str(flag))))
+                item.setData(0, ROLE_KIND, "country")
+                item.setData(0, ROLE_TARGET, r["country_code"])
+                item.setData(0, ROLE_LABEL, f"{r['country_name']} (random)")
+                self.add_random(item)
+                co = {"code": r["country_code"], "item": item, "cities": []}
+                self.countries.append(co)
+                ci = None
+            if ci is None or ci["code"] != r["city_code"]:
+                item = QTreeWidgetItem(co["item"])
+                item.setText(0, r["city_name"])
+                key = f"{r['country_code']}-{r['city_code']}"
+                item.setData(0, ROLE_KIND, "city")
+                item.setData(0, ROLE_TARGET, key)
+                item.setData(0, ROLE_LABEL, f"{r['city_name']}, {r['country_name']} (random)")
+                self.add_random(item)
+                ci = {"code": r["city_code"], "key": key, "item": item, "servers": []}
+                co["cities"].append(ci)
+            item = QTreeWidgetItem(ci["item"])
+            item.setText(0, r["hostname"])
+            item.setFont(0, self.mono)
+            item.setText(2, owner_text(r))
+            item.setForeground(2, GREEN if r["owned"] else AMBER)
+            item.setText(3, f"{r['network_port_speed']} Gbps")
+            item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            item.setData(0, ROLE_KIND, "server")
+            item.setData(0, ROLE_TARGET, r["hostname"])
+            item.setData(0, ROLE_LABEL, f"{r['city_name']}, {r['country_name']} ({r['hostname']})")
+            hay = " ".join(str(x) for x in (r["country_name"], r["country_code"], r["city_name"], r["hostname"], r["provider"],
+                                            "owned mullvad" if r["owned"] else "rented", r["network_port_speed"], "gbps")).lower()
+            ci["servers"].append({"item": item, "r": r, "hay": hay})
+            self.by_host[r["hostname"]] = {"r": r, "co": co, "ci": ci, "item": item}
+        self.was_searching = False
+        self.refresh_view()
+        self.expand_current_only()
+        self.update_count()
+
+    def add_random(self, item):
+        b = QPushButton("random")
+        b.setToolTip("Connect to a random server here")
+        b.setStyleSheet("QPushButton { padding: 1px 12px; border: 1px solid palette(mid); border-radius: 9px; background: palette(button); } "
+                        "QPushButton:hover { background: palette(midlight); }")
+        b.clicked.connect(lambda _=False, i=item: self.switch(i.data(0, ROLE_TARGET), i.data(0, ROLE_LABEL)))
+        self.tree.setItemWidget(item, 4, b)
+
+    # ---------------------------------------------------------------- view
+    def refresh_view(self, *_):
+        tokens = self.search.text().lower().split()
+        owned_only = self.owned.isChecked()
+        min_speed = self.speed.currentData() or 0
+        searching = bool(tokens)
+        cur = self.by_host.get(self.current)
+        hits, only = 0, None
+        for co in self.countries:
+            n_city = n_srv = 0
+            for ci in co["cities"]:
+                shown = owned_n = top = 0
+                for sv in ci["servers"]:
+                    r = sv["r"]
+                    ok = (not owned_only or r["owned"]) and r["network_port_speed"] >= min_speed and all(t in sv["hay"] for t in tokens)
+                    sv["item"].setHidden(not ok)
+                    self.style_server(sv["item"], r["hostname"] == self.current)
+                    if ok:
+                        shown += 1
+                        owned_n += 1 if r["owned"] else 0
+                        top = max(top, r["network_port_speed"])
+                        only = r["hostname"]
+                here = cur is not None and cur["ci"] is ci
+                ci["item"].setHidden(shown == 0)
+                self.set_details(ci["item"], f"{shown} {'server' if shown == 1 else 'servers'} · {owned_n} Mullvad-owned · up to {top} Gbps", here)
+                if shown:
+                    n_city += 1
+                    n_srv += shown
+                    if searching:
+                        ci["item"].setExpanded(True)
+            here = cur is not None and cur["co"] is co
+            co["item"].setHidden(n_srv == 0)
+            self.set_details(co["item"], f"{n_city} {'city' if n_city == 1 else 'cities'} · {n_srv} {'server' if n_srv == 1 else 'servers'}", here)
+            if searching and n_srv:
+                co["item"].setExpanded(True)
+            hits += n_srv
+        self.hits, self.only_hit = hits, (only if hits == 1 else None)
+        if self.was_searching and not searching:
+            self.expand_current_only()
+        self.was_searching = searching
+        self.update_count()
+
+    def set_details(self, item, text, here):
+        item.setText(1, text + ("   ● connected here" if here else ""))
+        item.setForeground(1, GREEN if here else self.palette().placeholderText())
+
+    def style_server(self, item, is_cur):
+        host = item.data(0, ROLE_TARGET)
+        item.setText(0, ("● " if is_cur else "") + host)
+        f = item.font(0)
+        f.setBold(is_cur)
+        item.setFont(0, f)
+        item.setForeground(0, GREEN if is_cur else self.palette().text())
+        for c in range(4):
+            item.setBackground(c, TINT if is_cur else NO_BRUSH)
+
+    def expand_current_only(self):
+        self.tree.collapseAll()
+        cur = self.by_host.get(self.current)
+        if cur:
+            cur["co"]["item"].setExpanded(True)
+            cur["ci"]["item"].setExpanded(True)
+
+    def update_count(self):
+        self.count.setText(f"{self.hits} {'server' if self.hits == 1 else 'servers'}  ·  {age_text(SERVERS)}")
+
+    def update_top(self):
+        self.btn_down.setEnabled(bool(self.current) and not self.busy)
+        cur = self.by_host.get(self.current)
+        if not cur:
+            self.top_flag.clear()
+            self.top_text.setText(f'<b style="color:{AMBER.name()}">● Not connected</b> &nbsp;<span style="color:gray">click a server to connect</span>')
+            return
+        r = cur["r"]
+        flag = FLAGS / f"{r['country_code']}.png"
+        if flag.exists():
+            self.top_flag.setPixmap(QPixmap(str(flag)).scaledToHeight(round(18 * self.zoom), Qt.TransformationMode.SmoothTransformation))
+        oc = (GREEN if r["owned"] else AMBER).name()
+        self.top_text.setText(
+            f'<b style="color:{GREEN.name()}">● Connected</b> &nbsp;{r["city_name"]}, {r["country_name"]} &nbsp;·&nbsp; {r["hostname"]} &nbsp;·&nbsp; '
+            f'<span style="color:{oc}">{owner_text(r)}</span> &nbsp;·&nbsp; {r["network_port_speed"]} Gbps')
+
+    # ---------------------------------------------------------------- actions
+    def item_clicked(self, item, _col):
+        kind = item.data(0, ROLE_KIND)
+        if kind == "server":
+            self.switch(item.data(0, ROLE_TARGET), item.data(0, ROLE_LABEL))
+        else:
+            item.setExpanded(not item.isExpanded())
+
+    def enter_pressed(self):
+        if self.only_hit:
+            item = self.by_host[self.only_hit]["item"]
+            self.switch(item.data(0, ROLE_TARGET), item.data(0, ROLE_LABEL))
+
+    def disconnect(self, force):
+        if self.busy:
+            return
+        self.busy = True
+        self.btn_down.setEnabled(False)
+        self.set_msg("Disconnecting…")
+
+        def done(ok, _out, err):
+            self.busy = False
+            if ok:
+                self.current = ""
+                self.refresh_view()
+                self.set_msg("Disconnected. Restart any VPN app (e.g. Firefox) to use the VPN again.")
+            elif "still running" in err:
+                self.set_msg("")
+                ask = QMessageBox.question(
+                    self, "Disconnect the VPN?",
+                    "Apps are still open inside the VPN (for example the VPN Firefox).\n"
+                    "They will lose their connection for good and must be restarted.\n\nDisconnect anyway?")
+                if ask == QMessageBox.StandardButton.Yes:
+                    self.disconnect(True)
+                    return
+            else:
+                self.set_msg(f"Disconnect failed: {err}", error=True)
+            self.poll()
+
+        self.run(["down", "force"] if force else ["down"], done)
+
+    def switch(self, target, label):
+        if self.busy:
+            return
+        if not self.key_ok:
+            self.set_msg("A valid Mullvad key is needed first.", error=True)
+            self.open_key()
+            return
+        self.busy = True
+        self.set_msg(f"Switching to {label}…")
+
+        def done(ok, _out, err):
+            self.busy = False
+            if ok:
+                self.set_msg(f"Switched to {label}")
+            else:
+                self.set_msg(f"Switch failed: {err}", error=True)
+                if "no valid Mullvad key" in err:
+                    self.open_key()
+            self.poll()
+
+        self.run(["switch", target], done)
+
+    def poll(self):
+        def done(ok, out, _err):
+            host = out if ok else ""
+            if host != self.current:
+                first = self.current == "" and host in self.by_host
+                self.current = host
+                self.refresh_view()
+                if first:
+                    self.expand_current_only()
+            self.update_top()
+
+        self.run(["current"], done)
+
+    def after_startup_refresh(self, ok, _out, err):
+        if ok:
+            self.rebuild()
+            self.update_top()
+            self.set_msg("")
+        else:
+            self.set_msg(f"Could not refresh the list (using the saved one): {err}", error=True)
+
+    def check_key(self):
+        self.run(["key", "status"], lambda ok, out, err: self.apply_key_status(out if ok else f"invalid||{err}"))
+
+    def apply_key_status(self, line):
+        kind, _, rest = line.partition("|")
+        path, _, extra = rest.partition("|")
+        self.key_ok = kind == "ok"
+        self.key_path = path
+        self.key_addr = extra if self.key_ok else ""
+        if self.key_ok:
+            self.key_problem = ""
+        elif kind == "missing":
+            self.key_problem = "No Mullvad key is stored yet. Add one to connect."
+        else:
+            self.key_problem = f"The stored key is not valid: {extra}"
+        self.btn_key.setText("Key…" if self.key_ok else "Key needed")
+        self.btn_key.setStyleSheet("" if self.key_ok else f"color: {RED.name()};")
+        if self.key_dlg is not None:
+            self.key_dlg.refresh()
+        if not self.key_ok and not self.key_prompted:
+            self.open_key()
+        self.key_prompted = True
+
+    def open_key(self):
+        if self.key_dlg is None:
+            self.key_dlg = KeyDialog(self)
+        self.key_dlg.refresh()
+        self.key_dlg.show()
+        self.key_dlg.raise_()
+
+    def open_apps(self):
+        if self.apps_dlg is None:
+            self.apps_dlg = AppsDialog(self)
+        self.apps_dlg.show()
+        self.apps_dlg.raise_()
+
+    def update_list(self):
+        if self.updating:
+            return
+        self.updating = True
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("Updating…")
+        self.set_msg("Downloading the server list from Mullvad…")
+
+        def done(ok, _out, err):
+            self.updating = False
+            self.btn_update.setEnabled(True)
+            self.btn_update.setText("Update list")
+            if ok:
+                self.rebuild()
+                self.update_top()
+                self.set_msg(f"Server list updated: {len(self.by_host)} servers")
+            else:
+                self.set_msg(f"Update failed: {err}", error=True)
+
+        self.run(["refresh", "force"], done)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("vpn-ns-qt")
+    app.setDesktopFileName("vpn-ns-qt")
+    w = Main()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

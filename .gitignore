@@ -1,0 +1,9 @@
+rust/target/
+dist/
+__pycache__/
+*.pyc
+# never commit keys or configs
+*.conf
+!apps.conf
+mullvad*.conf
+servers.json
